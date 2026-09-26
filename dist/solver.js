@@ -13,7 +13,9 @@
  *   · 由分层恒等式（coarea）：|x_v − x_u − t| = Σ_k |y_{v,k} − y_{u,k−t}|，
  *     每一项是两个 0/1 变量的绝对差，用一对反向、容量各为 w 的弧精确表示；
  *     若某侧指示落在自由等级区间之外则为常量，退化为源/汇弧或常数项；
- *   · 全部容量为整数，用 Dinic 求最大流，完全整数运算。
+ *   · 全部容量为整数，用 Dinic 求最大流；容量、流值、常量项与代价一律以
+ *     BigInt 任意精度整数运算（权重可达 1.2×10¹¹、总代价可达 10²¹ 量级，
+ *     IEEE-754 双精度无法无损表示个位，故不得使用 Number 累加）。
  *
  * 字典序最小：最大流残量图中从源可达的集合是所有最小割源侧集合的唯一最小元，
  * 它给出分量最小的 y，从而给出分量最小、亦即字典序最小的相位向量。
@@ -32,12 +34,38 @@
     MAX_PROBES: 40,
     MAX_WIDTH: 100,        // 单个探针 hi − lo 的上限（保证浏览器内响应）
     MAX_ABS_BOUND: 1e6,    // |lo|、|hi|、|target| 的上限
-    MAX_WEIGHT: 1e6,       // 权重上限（正整数）
+    MAX_WEIGHT: 120000000002, // 权重上限（正整数）
     MAX_EDGES: 1600,       // 40 探针全连接有向边（含自环）为 1600
-    MAX_GRAPH_ARCS: 2e6,   // 归约图规模保护
+    MAX_GRAPH_ARCS: 1e6,   // 归约图规模保护
   };
 
   const label = (id) => 'P' + id;
+
+  // 总代价的保护性上界：在给定输入限制下最坏约 6×10²⁰（< 2⁷⁰），2⁸⁰ 留有充裕余量。
+  const MAX_REPRESENTABLE_COST = 1n << 80n;
+
+  function estimateCostCeiling(probes, edges) {
+    const byId = new Map(probes
+      .filter((p) => p && typeof p === 'object' && Number.isInteger(p.id))
+      .map((p) => [p.id, p]));
+    let ceiling = 0n;
+    for (const e of edges) {
+      const from = byId.get(e && e.from);
+      const to = byId.get(e && e.to);
+      if (!from || !to) continue;
+      if (!Number.isInteger(e.target) || !Number.isInteger(e.weight)) continue;
+      if (!Number.isInteger(from.lo) || !Number.isInteger(from.hi)
+        || !Number.isInteger(to.lo) || !Number.isInteger(to.hi)) continue;
+      const lowDifference = to.lo - from.hi;
+      const highDifference = to.hi - from.lo;
+      const residualBound = Math.max(
+        Math.abs(lowDifference - e.target),
+        Math.abs(highDifference - e.target),
+      );
+      ceiling += BigInt(e.weight) * BigInt(residualBound);
+    }
+    return ceiling;
+  }
 
   /* ---------------- 输入校验：逐条定位错误 ---------------- */
   function validate(input) {
@@ -126,6 +154,11 @@
       }
     });
 
+    const costCeiling = estimateCostCeiling(probes, edges);
+    if (costCeiling > MAX_REPRESENTABLE_COST) {
+      err('edges', '观测边的加权成本上界超出可处理的数值范围');
+    }
+
     return errors;
   }
 
@@ -135,8 +168,9 @@
   }
 
   function addArc(g, u, v, c) {
-    const a = { to: v, cap: c, rev: null };
-    const b = { to: u, cap: 0, rev: a };
+    const cap = BigInt(c);
+    const a = { to: v, cap, orig: cap, rev: null, forward: true };
+    const b = { to: u, cap: 0n, orig: 0n, rev: a, forward: false };
     a.rev = b;
     g.adj[u].push(a);
     g.adj[v].push(b);
@@ -147,7 +181,12 @@
     const n = g.n;
     const level = new Int32Array(n);
     const it = new Int32Array(n);
-    let flow = 0;
+    let flow = 0n;
+
+    // 源点初始出弧容量之和是最大流的一个有限上界（此时反向弧容量均为 0），
+    // 作为 DFS 的增广预算，避免引入“无穷大”预算。
+    let flowBudget = 0n;
+    for (const e of g.adj[s]) flowBudget += e.cap;
 
     const bfs = () => {
       level.fill(-1);
@@ -156,7 +195,7 @@
       for (let h = 0; h < q.length; h++) {
         const v = q[h];
         for (const e of g.adj[v]) {
-          if (e.cap > 0 && level[e.to] < 0) {
+          if (e.cap > 0n && level[e.to] < 0) {
             level[e.to] = level[v] + 1;
             q.push(e.to);
           }
@@ -170,22 +209,23 @@
       const edges = g.adj[v];
       for (; it[v] < edges.length; it[v]++) {
         const e = edges[it[v]];
-        if (e.cap > 0 && level[e.to] === level[v] + 1) {
-          const d = dfs(e.to, Math.min(f, e.cap));
-          if (d > 0) {
+        if (e.cap > 0n && level[e.to] === level[v] + 1) {
+          const d = dfs(e.to, f < e.cap ? f : e.cap);
+          if (d > 0n) {
             e.cap -= d;
             e.rev.cap += d;
             return d;
           }
         }
       }
-      return 0;
+      return 0n;
     };
 
     while (bfs()) {
       it.fill(0);
+      // 源点初始出弧容量之和是最大流的一个有限上界，作为 DFS 的增广预算。
       let f;
-      while ((f = dfs(s, Infinity)) > 0) flow += f;
+      while ((f = dfs(s, flowBudget)) > 0n) flow += f;
     }
     return flow;
   }
@@ -198,13 +238,26 @@
     for (let h = 0; h < q.length; h++) {
       const v = q[h];
       for (const e of g.adj[v]) {
-        if (e.cap > 0 && !inS[e.to]) {
+        if (e.cap > 0n && !inS[e.to]) {
           inS[e.to] = 1;
           q.push(e.to);
         }
       }
     }
     return inS;
+  }
+
+  /* 独立复算割证书：对源侧集合 S，逐条前向弧累加其原始容量，当且仅当弧尾在 S、弧头在 T。
+   * 不使用流值，可与 maxflow + 常量项交叉检验最小割代价。 */
+  function cutCapacity(g, inS) {
+    let cap = 0n;
+    for (let u = 0; u < g.n; u++) {
+      if (!inS[u]) continue;
+      for (const e of g.adj[u]) {
+        if (e.forward && !inS[e.to]) cap += e.orig;
+      }
+    }
+    return cap;
   }
 
   /* ---------------- 求解 ---------------- */
@@ -237,13 +290,13 @@
     });
     const nodeOf = (i, k) => offsets[i] + (k - probes[i].lo - 1); // k ∈ (lo_i, hi_i]
 
-    // ∞ 容量：任意可行割的有限代价上界 + 1
-    let inf = 1;
+    // ∞ 容量：任意可行割的有限代价上界 + 1（BigInt 精确累加）
+    let inf = 1n;
     for (const e of edges) {
       const u = probes[pos.get(e.from)];
       const v = probes[pos.get(e.to)];
       const span = Math.max(v.hi, u.hi + e.target) - Math.min(v.lo, u.lo + e.target) + 1;
-      inf += e.weight * span;
+      inf += BigInt(e.weight) * BigInt(span);
     }
 
     // 规模保护
@@ -279,7 +332,7 @@
 
     // 观测边：w·|x_v − x_u − t| = w·Σ_k |y_{v,k} − y_{u,k−t}|
     // 常量区间（两侧指示均为常量）按段解析累加，不逐 k 展开，目标差值再大也不影响耗时。
-    let constantTerm = 0;
+    let constantTerm = 0n;
     for (const e of edges) {
       const ui = pos.get(e.from);
       const vi = pos.get(e.to);
@@ -287,6 +340,7 @@
       const v = probes[vi];
       const t = e.target;
       const w = e.weight;
+      const bw = BigInt(w);
       const kMin = Math.min(v.lo, u.lo + t) + 1;
       const kMax = Math.max(v.hi, u.hi + t);
       let k = kMin;
@@ -300,17 +354,17 @@
           const aC = aFree ? 0 : k <= v.lo ? 1 : 0;
           const bC = bFree ? 0 : j <= u.lo ? 1 : 0;
           if (aNode >= 0 && bNode >= 0) {
-            addArc(g, aNode, bNode, w);
-            addArc(g, bNode, aNode, w);
+            addArc(g, aNode, bNode, bw);
+            addArc(g, bNode, aNode, bw);
           } else if (aNode >= 0) {
             // 代价 w·|y_a − bC|：bC=1 → y_a=0 时付费（源→a）；bC=0 → y_a=1 时付费（a→汇）
-            if (bC === 1) addArc(g, S, aNode, w);
-            else addArc(g, aNode, T, w);
+            if (bC === 1) addArc(g, S, aNode, bw);
+            else addArc(g, aNode, T, bw);
           } else if (bNode >= 0) {
-            if (aC === 1) addArc(g, S, bNode, w);
-            else addArc(g, bNode, T, w);
+            if (aC === 1) addArc(g, S, bNode, bw);
+            else addArc(g, bNode, T, bw);
           } else {
-            constantTerm += w * Math.abs(aC - bC);
+            constantTerm += bw * BigInt(Math.abs(aC - bC));
           }
           k++;
         } else {
@@ -325,7 +379,7 @@
           if (c2 > k && c2 < next) next = c2;
           if (c3 > k && c3 < next) next = c3;
           if (c4 > k && c4 < next) next = c4;
-          constantTerm += w * Math.abs(aC - bC) * (next - k);
+          constantTerm += bw * BigInt(Math.abs(aC - bC)) * BigInt(next - k);
           k = next;
         }
       }
@@ -346,7 +400,7 @@
     const rows = edges.map((e, i) => {
       const actual = phaseAt[pos.get(e.to)] - phaseAt[pos.get(e.from)];
       const residual = actual - e.target;
-      const contribution = e.weight * Math.abs(residual);
+      const contribution = BigInt(e.weight) * BigInt(Math.abs(residual));
       return {
         index: i,
         from: e.from,
@@ -358,7 +412,8 @@
         contribution,
       };
     });
-    const totalCost = rows.reduce((s, r) => s + r.contribution, 0);
+    const totalCost = rows.reduce((s, r) => s + r.contribution, 0n);
+    const cutValue = cutCapacity(g, inS);
 
     return {
       ok: true,
@@ -369,6 +424,7 @@
         nodes: nodeCount,
         arcs: g.arcs,
         flowValue,
+        cutValue,
         constantTerm,
       },
     };

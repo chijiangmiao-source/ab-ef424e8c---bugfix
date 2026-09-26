@@ -61,7 +61,7 @@ try {
       { from: 0, to: 2, target: 6, weight: 10 },
     ],
   });
-  if (r.ok && r.totalCost === 4 && r.phases.map((p) => p.phase).join(',') === '0,1,6') {
+  if (r.ok && r.totalCost === 4n && r.phases.map((p) => p.phase).join(',') === '0,1,6') {
     ok('样例结论 (0,1,6)，总代价 4');
   } else {
     bad('样例自检失败: ' + JSON.stringify(r));
