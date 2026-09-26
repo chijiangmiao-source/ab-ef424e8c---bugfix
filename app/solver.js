@@ -13,7 +13,9 @@
  *   · 由分层恒等式（coarea）：|x_v − x_u − t| = Σ_k |y_{v,k} − y_{u,k−t}|，
  *     每一项是两个 0/1 变量的绝对差，用一对反向、容量各为 w 的弧精确表示；
  *     若某侧指示落在自由等级区间之外则为常量，退化为源/汇弧或常数项；
- *   · 全部容量为整数，用 Dinic 求最大流，完全整数运算。
+ *   · 全部容量、流量、常量项与代价均为任意精度整数（BigInt），用 Dinic 求最大流，
+ *     完全整数运算：权重再大（如 1.2×10¹¹ 量级、总代价超过 2⁵³）也不丢精度，
+ *     总代价、逐边贡献与最小割证书（流值 + 常量项）恒为同一个精确整数。
  *
  * 字典序最小：最大流残量图中从源可达的集合是所有最小割源侧集合的唯一最小元，
  * 它给出分量最小的 y，从而给出分量最小、亦即字典序最小的相位向量。
@@ -154,14 +156,14 @@
     return errors;
   }
 
-  /* ---------------- s-t 最小割（Dinic，整数容量，精确） ---------------- */
+  /* ---------------- s-t 最小割（Dinic，BigInt 容量，任意精度精确） ---------------- */
   function createGraph(n) {
     return { n, arcs: 0, adj: Array.from({ length: n }, () => []) };
   }
 
   function addArc(g, u, v, c) {
     const a = { to: v, cap: c, rev: null };
-    const b = { to: u, cap: 0, rev: a };
+    const b = { to: u, cap: 0n, rev: a };
     a.rev = b;
     g.adj[u].push(a);
     g.adj[v].push(b);
@@ -172,7 +174,10 @@
     const n = g.n;
     const level = new Int32Array(n);
     const it = new Int32Array(n);
-    let flow = 0;
+    let flow = 0n;
+    // 推送上界的“无穷”：输入受限（边数、权重、范围宽度均有上限），
+    // 全图容量总和远小于 2^126，取其为永不触顶的 BigInt 常量。
+    const INF = 1n << 126n;
 
     const bfs = () => {
       level.fill(-1);
@@ -181,7 +186,7 @@
       for (let h = 0; h < q.length; h++) {
         const v = q[h];
         for (const e of g.adj[v]) {
-          if (e.cap > 0 && level[e.to] < 0) {
+          if (e.cap > 0n && level[e.to] < 0) {
             level[e.to] = level[v] + 1;
             q.push(e.to);
           }
@@ -195,22 +200,22 @@
       const edges = g.adj[v];
       for (; it[v] < edges.length; it[v]++) {
         const e = edges[it[v]];
-        if (e.cap > 0 && level[e.to] === level[v] + 1) {
-          const d = dfs(e.to, Math.min(f, e.cap));
-          if (d > 0) {
+        if (e.cap > 0n && level[e.to] === level[v] + 1) {
+          const d = dfs(e.to, f < e.cap ? f : e.cap);
+          if (d > 0n) {
             e.cap -= d;
             e.rev.cap += d;
             return d;
           }
         }
       }
-      return 0;
+      return 0n;
     };
 
     while (bfs()) {
       it.fill(0);
       let f;
-      while ((f = dfs(s, Infinity)) > 0) flow += f;
+      while ((f = dfs(s, INF)) > 0n) flow += f;
     }
     return flow;
   }
@@ -223,7 +228,7 @@
     for (let h = 0; h < q.length; h++) {
       const v = q[h];
       for (const e of g.adj[v]) {
-        if (e.cap > 0 && !inS[e.to]) {
+        if (e.cap > 0n && !inS[e.to]) {
           inS[e.to] = 1;
           q.push(e.to);
         }
@@ -262,13 +267,13 @@
     });
     const nodeOf = (i, k) => offsets[i] + (k - probes[i].lo - 1); // k ∈ (lo_i, hi_i]
 
-    // ∞ 容量：任意可行割的有限代价上界 + 1
-    let inf = 1;
+    // ∞ 容量：任意可行割的有限代价上界 + 1（BigInt 精确，不随权重量级丢失精度）
+    let inf = 1n;
     for (const e of edges) {
       const u = probes[pos.get(e.from)];
       const v = probes[pos.get(e.to)];
       const span = Math.max(v.hi, u.hi + e.target) - Math.min(v.lo, u.lo + e.target) + 1;
-      inf += e.weight * span;
+      inf += BigInt(e.weight) * BigInt(span);
     }
 
     // 规模保护
@@ -304,14 +309,15 @@
 
     // 观测边：w·|x_v − x_u − t| = w·Σ_k |y_{v,k} − y_{u,k−t}|
     // 常量区间（两侧指示均为常量）按段解析累加，不逐 k 展开，目标差值再大也不影响耗时。
-    let constantTerm = 0;
+    // 容量与常量项均为 BigInt：w 本身可精确表示，但 w 的累加与乘积可超过 2⁵³。
+    let constantTerm = 0n;
     for (const e of edges) {
       const ui = pos.get(e.from);
       const vi = pos.get(e.to);
       const u = probes[ui];
       const v = probes[vi];
       const t = e.target;
-      const w = e.weight;
+      const w = BigInt(e.weight);
       const kMin = Math.min(v.lo, u.lo + t) + 1;
       const kMax = Math.max(v.hi, u.hi + t);
       let k = kMin;
@@ -335,7 +341,7 @@
             if (aC === 1) addArc(g, S, bNode, w);
             else addArc(g, bNode, T, w);
           } else {
-            constantTerm += w * Math.abs(aC - bC);
+            constantTerm += w * BigInt(Math.abs(aC - bC));
           }
           k++;
         } else {
@@ -350,7 +356,7 @@
           if (c2 > k && c2 < next) next = c2;
           if (c3 > k && c3 < next) next = c3;
           if (c4 > k && c4 < next) next = c4;
-          constantTerm += w * Math.abs(aC - bC) * (next - k);
+          constantTerm += w * BigInt(Math.abs(aC - bC)) * BigInt(next - k);
           k = next;
         }
       }
@@ -371,7 +377,7 @@
     const rows = edges.map((e, i) => {
       const actual = phaseAt[pos.get(e.to)] - phaseAt[pos.get(e.from)];
       const residual = actual - e.target;
-      const contribution = e.weight * Math.abs(residual);
+      const contribution = BigInt(e.weight) * BigInt(Math.abs(residual));
       return {
         index: i,
         from: e.from,
@@ -383,7 +389,8 @@
         contribution,
       };
     });
-    const totalCost = rows.reduce((s, r) => s + r.contribution, 0);
+    // 总代价为 BigInt：逐边贡献精确相加，与最小割证书（流值 + 常量项）恒等
+    const totalCost = rows.reduce((s, r) => s + r.contribution, 0n);
 
     return {
       ok: true,

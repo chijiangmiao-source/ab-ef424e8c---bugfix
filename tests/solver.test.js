@@ -4,7 +4,11 @@
  *  · 字典序平局规则、方向性、权重、退化范围、自环等语义；
  *  · 错误定位（范围为空 / 参考点越界 / 端点不存在等）；
  *  · 与暴力枚举的随机对拍（仅测试使用枚举，求解器本身不枚举）；
- *  · 流值不变量：maxflow + 常量项 ≡ 总代价。
+ *  · 流值不变量：maxflow + 常量项 ≡ 总代价；
+ *  · 大权重场景（总代价超过 2⁵³）：总代价、逐边贡献、最小割证书精确一致。
+ *
+ * 代价类字段（totalCost / contribution / flowValue / constantTerm）均为 BigInt，
+ * 与 Number 比较需先转换。
  */
 'use strict';
 
@@ -44,7 +48,7 @@ test('闭环矛盾样例：全局最优严格优于沿生成树逐边累加', ()
     { id: 1, phase: 1 },
     { id: 2, phase: 6 },
   ]);
-  assert.equal(r.totalCost, 4);
+  assert.equal(r.totalCost, 4n);
 
   // 沿生成树 P0→P1→P2 逐边累加得 (0, 5, 10)，代价 40
   const tree = { 0: 0, 1: 5, 2: 10 };
@@ -55,7 +59,7 @@ test('闭环矛盾样例：全局最优严格优于沿生成树逐边累加', ()
   // 边明细：实际差 / 残差 / 贡献
   assert.deepEqual(
     r.edges.map((e) => [e.actual, e.residual, e.contribution]),
-    [[1, -4, 4], [5, 0, 0], [6, 0, 0]],
+    [[1, -4, 4n], [5, 0, 0n], [6, 0, 0n]],
   );
 });
 
@@ -80,7 +84,7 @@ test('字典序平局：无边时取各探针下限（参考为 0）', () => {
   });
   assert.ok(r.ok);
   assert.deepEqual(r.phases.map((p) => p.phase), [0, -3, 2]);
-  assert.equal(r.totalCost, 0);
+  assert.equal(r.totalCost, 0n);
 });
 
 test('字典序平局：等值约束下取分量最小解', () => {
@@ -114,7 +118,7 @@ test('权重决定折中位置（加权中位数）', () => {
   });
   assert.ok(r.ok);
   assert.deepEqual(r.phases.map((p) => p.phase), [0, 10, 10]);
-  assert.equal(r.totalCost, 10);
+  assert.equal(r.totalCost, 10n);
 });
 
 test('有向边方向语义：P1→P0 与 P0→P1 符号相反', () => {
@@ -143,7 +147,7 @@ test('自环边只贡献常数 w·|t|，不影响相位', () => {
   });
   assert.ok(r.ok);
   assert.deepEqual(r.phases.map((p) => p.phase), [0, 2]);
-  assert.equal(r.totalCost, 6);
+  assert.equal(r.totalCost, 6n);
 });
 
 test('结果按探针标识升序排列，与输入顺序无关', () => {
@@ -326,7 +330,7 @@ test('随机对拍：最小割结论与暴力枚举完全一致（成本 + 字�
 
     const bf = bruteForce(input);
     const gotVec = r.phases.map((p) => p.phase);
-    assert.equal(r.totalCost, bf.cost, `trial ${trial} 成本不一致: ${JSON.stringify(input)}`);
+    assert.equal(r.totalCost, BigInt(bf.cost), `trial ${trial} 成本不一致: ${JSON.stringify(input)}`);
     assert.deepEqual(gotVec, bf.vec, `trial ${trial} 字典序最小向量不一致: ${JSON.stringify(input)}`);
 
     // 流值不变量：maxflow + 常量项 ≡ 总代价
@@ -354,5 +358,83 @@ test('大目标差值不触发逐层展开（常量区间解析累加）', () =>
   assert.ok(r.ok);
   // x1 − x0 最多为 5，残差恒为 5 − 1e6
   assert.deepEqual(r.phases.map((p) => p.phase), [0, 5]);
-  assert.equal(r.totalCost, 3 * Math.abs(5 - 1000000));
+  assert.equal(r.totalCost, 3n * BigInt(Math.abs(5 - 1000000)));
+});
+
+/* ---------------- 大权重场景：总代价超过 2⁵³ 仍须精确复算 ---------------- */
+
+test('大权重场景：1600 条观测全部保留，总代价 / 逐边贡献 / 最小割证书为同一精确整数', () => {
+  // P0 固定零参考，P1 ∈ [0, 100]；
+  // 799 条 (t=0, w=120000000001) + 799 条 (t=100, w=120000000001)
+  // + 1 条 (t=100, w=120000000002) + 1 条 (t=99, w=1)
+  const edges = [];
+  for (let i = 0; i < 799; i++) edges.push({ from: 0, to: 1, target: 0, weight: 120000000001 });
+  for (let i = 0; i < 799; i++) edges.push({ from: 0, to: 1, target: 100, weight: 120000000001 });
+  edges.push({ from: 0, to: 1, target: 100, weight: 120000000002 });
+  edges.push({ from: 0, to: 1, target: 99, weight: 1 });
+
+  const r = solver.solve({
+    probes: [
+      { id: 0, lo: 0, hi: 0 },
+      { id: 1, lo: 0, hi: 100 },
+    ],
+    reference: 0,
+    edges,
+  });
+  assert.ok(r.ok, JSON.stringify(r.errors));
+
+  // 全部 1600 条观测保留在结论中
+  assert.equal(r.edges.length, 1600);
+
+  // 相位结论：P0 = 0，P1 = 100
+  assert.deepEqual(r.phases, [
+    { id: 0, phase: 0 },
+    { id: 1, phase: 100 },
+  ]);
+
+  // 总代价为超出 2⁵³ 的精确整数：799·100·120000000001 + 1·1 = 9588000000079901
+  const expected = 9588000000079901n;
+  assert.ok(expected > 2n ** 53n, '本场景总代价必须超出双精度可精确表示的范围');
+  assert.equal(r.totalCost, expected);
+
+  // 逐边贡献精确相加，与总代价是同一个整数（无损复算）
+  let perEdgeSum = 0n;
+  for (const row of r.edges) perEdgeSum += row.contribution;
+  assert.equal(perEdgeSum, r.totalCost);
+
+  // 逐边明细：799 条贡献 100·120000000001，800 条贡献 0，末条贡献 1
+  const contribs = r.edges.map((row) => row.contribution);
+  assert.deepEqual(contribs.slice(0, 799), Array(799).fill(12000000000100n));
+  assert.deepEqual(contribs.slice(799, 1599), Array(800).fill(0n));
+  assert.equal(contribs[1599], 1n);
+  assert.ok(r.edges.every((row) => row.actual === 100));
+
+  // 最小割证书：流值 + 常量项 ≡ 总代价（同一精确整数）
+  assert.equal(r.stats.flowValue + r.stats.constantTerm, r.totalCost);
+  assert.equal(r.stats.constantTerm, 0n);
+  assert.equal(r.stats.flowValue, expected);
+});
+
+test('大权重 + 大目标差值混合：常量项与流值分开累加仍精确一致', () => {
+  // 最优为 x1 = 0：大权重边贡献 0；t = 10⁶ 的边贡献 3·1000000，
+  // 其中 3·100 经割图流值、3·999900 经常量区间解析累加（常量项）。
+  const r = solver.solve({
+    probes: [
+      { id: 0, lo: 0, hi: 0 },
+      { id: 1, lo: 0, hi: 100 },
+    ],
+    reference: 0,
+    edges: [
+      { from: 0, to: 1, target: 0, weight: 120000000002 },
+      { from: 0, to: 1, target: 1000000, weight: 3 },
+    ],
+  });
+  assert.ok(r.ok, JSON.stringify(r.errors));
+  assert.deepEqual(r.phases.map((p) => p.phase), [0, 0]);
+  const expected = 3n * BigInt(1000000);
+  assert.equal(r.totalCost, expected);
+  assert.equal(r.stats.flowValue + r.stats.constantTerm, r.totalCost);
+  let perEdgeSum = 0n;
+  for (const row of r.edges) perEdgeSum += row.contribution;
+  assert.equal(perEdgeSum, r.totalCost);
 });
